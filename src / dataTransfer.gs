@@ -1,6 +1,6 @@
 
 // ==================================================================
-// ★★★ main.gs - メイン処理 ★★★
+// ★★★ dataTransfer - メイン処理 ★★★
 // ==================================================================
 // [INDEX]
 // [ENTRY]    handleProjectUpdate
@@ -80,7 +80,15 @@ function handleProjectUpdate(e) {
   }
   timer.lap("転記先SS接続");
 
-  const context = { C, destSs, sourceData, range, timer, triggerConfig };
+  // 売上予定日から対応する年度シート名を解決(必要なら新年度シートを自動作成)
+  const resolvedSheetName = resolveSalesSheetName(sourceData.salesDate);
+  if (resolvedSheetName !== C.DEST_SHEET_SALES) {
+    Logger.log(`📅 年度切替検出: 転記先シート = ${resolvedSheetName}`);
+  }
+  // C をシャローコピーして、このリクエスト限定で DEST_SHEET_SALES を上書き
+  const requestC = Object.assign({}, C, { DEST_SHEET_SALES: resolvedSheetName });
+
+  const context = { C: requestC, destSs, sourceData, range, timer, triggerConfig };
 
   try {
     switch (triggerConfig.type) {
@@ -774,7 +782,10 @@ function findMonthBlock(data, searchMonthString, cols) {
   }
 
   const blockEnd = monthHeaderRow - 1;
-  const blockStart = (prevMonthHeaderRow === -1) ? 0 : prevMonthHeaderRow + 1;
+  // ★ 最初の月ブロック(前月ヘッダーなし)の場合は、0ではなくデータ開始行を起点にする
+  //   (1〜2行目=タイトル, 3行目=見出し を避け、4行目〜をデータ範囲とする)
+  const dataStartIdx = (CONFIG_PROJECT.DATA_START_ROW || 4) - 1;  // 0始まりインデックス
+  const blockStart = (prevMonthHeaderRow === -1) ? dataStartIdx : prevMonthHeaderRow + 1;
   return { start: blockStart, end: blockEnd };
 }
 
@@ -909,20 +920,28 @@ function ensureRowExists(sheet, rowNumber) {
 function clearTargetRow(objectNumber, destSs, sheetName) {
   const C = CONFIG_PROJECT;
   const cols = C.DESTINATION_COLUMNS;
-  const sheet = destSs.getSheetByName(sheetName);
-  if (!sheet) return;
 
-  const data = sheet.getDataRange().getValues();
-  const targetRowNumber = findExistingRowByObjectNo(data, objectNumber, cols);
+  // 段階的検索: まず指定シート(最新年度)を先頭にした年度シート名リストを取得
+  const sheetNames = getFiscalSalesSheetNames_(destSs, sheetName);
 
-  if (targetRowNumber) {
-    const START_COL = cols.STORE;
-    const END_COL = cols.SALES_COL;
-    Logger.log(`🗑️ クリア: ${targetRowNumber}行目`);
-    sheet.getRange(targetRowNumber, START_COL, 1, END_COL - START_COL + 1).clearContent();
-  } else {
-    Logger.log(`ℹ️ クリア対象なし (物件No: ${objectNumber})`);
+  for (let s = 0; s < sheetNames.length; s++) {
+    const name = sheetNames[s];
+    const sheet = destSs.getSheetByName(name);
+    if (!sheet) continue;
+
+    const data = sheet.getDataRange().getValues();
+    const targetRowNumber = findExistingRowByObjectNo(data, objectNumber, cols);
+
+    if (targetRowNumber) {
+      const START_COL = cols.STORE;
+      const END_COL = cols.SALES_COL;
+      Logger.log(`🗑️ クリア: 「${name}」${targetRowNumber}行目 (物件No: ${objectNumber})`);
+      sheet.getRange(targetRowNumber, START_COL, 1, END_COL - START_COL + 1).clearContent();
+      return;  // 物件Noはユニークなので、見つけたら打ち切り
+    }
   }
+
+  Logger.log(`ℹ️ クリア対象なし: 全年度シートを探しましたが物件No ${objectNumber} は見つかりませんでした`);
 }
 
 // ==================================================================

@@ -106,8 +106,8 @@ function handleManufacturingOverheadEdit(e) {
 
   const sheet = e.range.getSheet();
 
-  // 対象シート以外は無視
-  if (sheet.getName() !== MFG_CONFIG.SOURCE_SHEET_NAME) return;
+  // 「{西暦}製造間接費入力シート(事務員専用)」形式のシート全てを対象に
+  if (!/^\d{4}製造間接費入力シート[((]事務員専用[))]$/.test(sheet.getName())) return;
 
   const col = e.range.getColumn();
   const row = e.range.getRow();
@@ -159,6 +159,7 @@ function handleManufacturingOverheadEdit(e) {
 // ============================================================
 function handleDataEdit_(sheet, row) {
   const rowData = getSourceRowData_(sheet, row);
+  const srcSheetName = sheet.getName();  // 追加
 
   Logger.log(`📝 データ編集: 行=${row}, 月=${rowData.month}, 物件No=${rowData.bukkenNo}, 顧客=${rowData.customer}, 粗利=${rowData.grossProfit}`);
 
@@ -172,7 +173,7 @@ function handleDataEdit_(sheet, row) {
   if (isEmptyRow_(rowData)) {
     // 既に転記済みなら転記先を削除し、H/Iをクリア
     if (rowData.destRow) {
-      deleteDestRow_(rowData);
+      deleteDestRow_(rowData, srcSheetName);
       Logger.log(`🗑 データ削除を検知: 転記先行 ${rowData.destRow} を削除`);
     }
 
@@ -185,7 +186,7 @@ function handleDataEdit_(sheet, row) {
 
   // H列がチェック済み かつ I列に転記先行番号あり → 更新処理
   if (rowData.isChecked && rowData.destRow) {
-    updateDestRow_(rowData);
+    updateDestRow_(rowData, srcSheetName);
   } else {
     // 新規追加処理
     insertNewRow_(sheet, row, rowData);
@@ -197,6 +198,7 @@ function handleDataEdit_(sheet, row) {
 // ============================================================
 function handleCheckboxToggle_(sheet, row, e) {
   const rowData = getSourceRowData_(sheet, row);
+  const srcSheetName = sheet.getName();  // ★この行を追加
   const newValue = e.value === 'TRUE' || e.value === true;
 
   Logger.log(`☑ チェック操作: 行=${row}, 新状態=${newValue}, 転記先行=${rowData.destRow}`);
@@ -230,7 +232,7 @@ function handleCheckboxToggle_(sheet, row, e) {
       return;
     }
 
-    deleteDestRow_(rowData);
+    deleteDestRow_(rowData, srcSheetName);
 
     // I列の行番号をクリア
     sheet.getRange(row, MFG_CONFIG.SRC_COL.DEST_ROW).clearContent();
@@ -242,7 +244,7 @@ function handleCheckboxToggle_(sheet, row, e) {
 // 新規追加処理
 // ============================================================
 function insertNewRow_(sheet, srcRow, rowData) {
-  const destSheet = getDestSheet_();
+  const destSheet = getDestSheet_(sheet.getName());
   if (!destSheet) return;
 
   // 該当月ブロックの空行を探す
@@ -266,10 +268,9 @@ function insertNewRow_(sheet, srcRow, rowData) {
 // ============================================================
 // 更新処理
 // ============================================================
-function updateDestRow_(rowData) {
-  const destSheet = getDestSheet_();
+function updateDestRow_(rowData, srcSheetName) {
+  const destSheet = getDestSheet_(srcSheetName);
   if (!destSheet) return;
-
   writeToDestRow_(destSheet, rowData.destRow, rowData);
   Logger.log(`🔄 更新完了: 転記先行=${rowData.destRow}`);
 }
@@ -277,10 +278,9 @@ function updateDestRow_(rowData) {
 // ============================================================
 // 削除処理（転記先の行全体をクリア）
 // ============================================================
-function deleteDestRow_(rowData) {
-  const destSheet = getDestSheet_();
+function deleteDestRow_(rowData, srcSheetName) {
+  const destSheet = getDestSheet_(srcSheetName);
   if (!destSheet) return;
-
   const lastCol = destSheet.getLastColumn();
   destSheet.getRange(rowData.destRow, 1, 1, lastCol).clearContent();
 }
@@ -297,13 +297,29 @@ function writeToDestRow_(destSheet, destRow, rowData) {
 // ============================================================
 // 転記先シート取得
 // ============================================================
-function getDestSheet_() {
+function getDestSheet_(srcSheetName) {
   try {
     const destSs = SpreadsheetApp.openById(MFG_CONFIG.DEST_SPREADSHEET_ID);
-    const destSheet = destSs.getSheetByName(MFG_CONFIG.DEST_SHEET_NAME);
 
+    // srcSheetName から対応する年度シート名を解決(なければ自動作成)
+    let destSheetName = MFG_CONFIG.DEST_SHEET_NAME;  // フォールバック
+    if (srcSheetName) {
+      const resolved = resolveSalesSheetNameFromMfgSheet(srcSheetName);
+      if (resolved) {
+        // 対応する売上進捗表がなければ作成する必要があるが、
+        // 通常は売上予定日編集時に作成済みのはず。念のため存在チェック。
+        if (destSs.getSheetByName(resolved)) {
+          destSheetName = resolved;
+        } else {
+          Logger.log(`⚠ 転記先シート「${resolved}」が未作成。営業進捗管理側で売上予定日を編集してください`);
+          return null;
+        }
+      }
+    }
+
+    const destSheet = destSs.getSheetByName(destSheetName);
     if (!destSheet) {
-      Logger.log(`❌ 転記先シート「${MFG_CONFIG.DEST_SHEET_NAME}」が見つかりません`);
+      Logger.log(`❌ 転記先シート「${destSheetName}」が見つかりません`);
       return null;
     }
     return destSheet;
@@ -598,8 +614,10 @@ function manualTransferCurrentRow() {
  * 転記先シートの合計行を検出してログ出力する。
  * 月ブロックが正しく認識されているか確認用。
  */
-function debugListMonthBlocks() {
-  const destSheet = getDestSheet_();
+function debugListMonthBlocks(srcSheetName) {
+  // 引数がなければ最新の製造間接費シートから推定
+  const name = srcSheetName || MFG_CONFIG.SOURCE_SHEET_NAME;
+  const destSheet = getDestSheet_(name);
   if (!destSheet) return;
 
   const lastRow = destSheet.getLastRow();
