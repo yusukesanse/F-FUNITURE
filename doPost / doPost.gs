@@ -1,38 +1,37 @@
 /**
  * ============================================================
- * doPost.gs — Zoho CRM Webhook 受信 → 「営業進捗管理」シート書き込み
+ * webhook.gs ― Zoho CRM Webhook 受信 →「営業進捗管理」シート書き込み
  * ============================================================
- * 【設計方針】
- *  - 列はヘッダー文字列で検索して書き込む（列の追加・並び替えに強い）。
- *  - マッピング対象の列だけを setValue で書く。
- *    → 数式列（粗利額（自動計算）/ 実粗利率（自動計算））や、
- *      担当者が手入力する列（見積金額・原価 等）は一切触らない。
- *  - 1リクエスト＝1行なので setValue（個別書き込み）で十分。
+ * 【役割】このファイルだけで完結する。doPost が Zoho からのデータを
+ *   「営業進捗管理」シートへ書き込む。その後の転記は人の手入力編集で
+ *   salesTransfer.gs の編集トリガーが行う（doPost の setValue では
+ *   編集トリガーは発火しない＝二重処理にならない）。
  *
- * 【カスタマイズ】
- *  - 受け取る項目を増やすときは DIRECT_MAP に1行追加するだけ。
- *    （左＝シートのヘッダー名 / 右＝Zoho のパラメータ名）
- *  - 加工が必要な項目（電話番号・来場日/来場年）だけ buildWriteMap_ で個別処理。
+ * 【設計】列はヘッダー文字列で検索（列の追加・並び替えに強い）。
+ *   マッピング対象の列だけ setValue する。数式列・手入力列は触らない。
+ *
+ * 【カスタマイズ】受け取る項目を増やすときは WEBHOOK_FIELD_MAP に1行追加。
+ *   （左＝シートのヘッダー名 ／ 右＝Zoho のパラメータ名）
  * ============================================================
  */
 
 // ============================================================
-// 設定
+// 設定（このファイル専用）
 // ============================================================
-const CONFIG = {
-  PROP_KEY_SS_ID: "SPREADSHEET_ID",   // スプレッドシートIDを保存したスクリプトプロパティのキー名
+const WEBHOOK_CONFIG = {
+  PROP_KEY_SS_ID: "SPREADSHEET_ID",   // 営業進捗管理スプレッドシートIDのプロパティ名
   SHEET_NAME:     "営業進捗管理",      // 書き込み先シート
 
-  COL_MATCH:    "物件ナンバー",        // この列が一致したら UPDATE（一致しなければ APPEND）
+  COL_MATCH:    "物件ナンバー",        // 一致したら UPDATE（しなければ APPEND）
   COL_PROJECT:  "案件名",              // 過去の資料請求の照合に使う列
   COL_HAS_PAST: "過去の資料請求",      // 過去の資料請求の結果（有り/無し）を書く列
 
   // 新規行を探すときの空白判定列（すべて空ならその行に書き込む）
-  CHECK_EMPTY_COLS: ["物件ナンバー", "チャネル", "来場年", "来場日", "ステージ", "案件名"],
+  CHECK_EMPTY_COLS: ["物件ナンバー", "チャネル", "来場年", "来場日", "ステージ", "案件名"]
 };
 
 // シートのヘッダー名 → Zoho のパラメータ名（値をそのまま入れる項目）
-const DIRECT_MAP = {
+const WEBHOOK_FIELD_MAP = {
   "物件ナンバー":   "property_number",
   "チャネル":       "showroom",
   "ステージ":       "stage",
@@ -44,7 +43,7 @@ const DIRECT_MAP = {
   "現住所":         "address",
   "メールアドレス": "mail",
   "内容":           "inquiry_detail",
-  "情報":           "contact_detail",
+  "情報":           "contact_detail"
 };
 
 // ============================================================
@@ -55,36 +54,31 @@ function doPost(e) {
   try {
     if (!e || !e.parameter) throw new Error("Webhook パラメータが空です。");
 
-    const ssId = PropertiesService.getScriptProperties().getProperty(CONFIG.PROP_KEY_SS_ID);
+    const ssId = PropertiesService.getScriptProperties().getProperty(WEBHOOK_CONFIG.PROP_KEY_SS_ID);
     if (!ssId) throw new Error("スプレッドシートIDがスクリプトプロパティに未設定です。");
 
-    const sheet = SpreadsheetApp.openById(ssId).getSheetByName(CONFIG.SHEET_NAME);
-    if (!sheet) throw new Error(`シート「${CONFIG.SHEET_NAME}」が見つかりません。`);
+    const sheet = SpreadsheetApp.openById(ssId).getSheetByName(WEBHOOK_CONFIG.SHEET_NAME);
+    if (!sheet) throw new Error(`シート「${WEBHOOK_CONFIG.SHEET_NAME}」が見つかりません。`);
 
     const data = sheet.getDataRange().getValues();
     if (data.length === 0) throw new Error("シートにヘッダー行がありません。");
 
     const headerMap = buildHeaderMap_(data[0]);   // ヘッダー名 → 列インデックス(0始まり)
-
-    // 書き込む値を { ヘッダー名: 値 } の形で用意
-    const writeMap = buildWriteMap_(e.parameter);
+    const writeMap  = buildWriteMap_(e.parameter); // { ヘッダー名: 値 }
 
     // 全データ行を1回走査し、物件ナンバー一致行と案件名一致数を取得
     const { updateRow, nameMatchCount } = scanRows_(data, headerMap, writeMap);
 
-    // 書き込み先の行（1始まり）を決定
     let targetRow, action;
     if (updateRow) {
       targetRow = updateRow;
       action = "UPDATE";
     } else {
-      targetRow = findFirstEmptyRow_(data, headerMap, CONFIG.CHECK_EMPTY_COLS);
+      targetRow = findFirstEmptyRow_(data, headerMap, WEBHOOK_CONFIG.CHECK_EMPTY_COLS);
       action = "APPEND";
-      // 過去の資料請求は新規追加時のみ記入
-      writeMap[CONFIG.COL_HAS_PAST] = (nameMatchCount >= 1) ? "有り" : "無し";
+      writeMap[WEBHOOK_CONFIG.COL_HAS_PAST] = (nameMatchCount >= 1) ? "有り" : "無し";
     }
 
-    // マッピング対象の列だけを書き込む（数式列・手入力列は触らない）
     writeMappedCells_(sheet, targetRow, headerMap, writeMap);
     SpreadsheetApp.flush();
 
@@ -104,18 +98,18 @@ function doPost(e) {
 /** ヘッダー配列 → { ヘッダー名(トリム済): 列インデックス(0始まり) } */
 function buildHeaderMap_(headers) {
   const map = {};
-  headers.forEach(function(h, i) { map[String(h).trim()] = i; });
+  headers.forEach(function (h, i) { map[String(h).trim()] = i; });
   return map;
 }
 
 /** Webhook パラメータ → { ヘッダー名: 値 } */
 function buildWriteMap_(p) {
-  const clean = function(v) { return String(v || "").trim(); };
+  const clean = function (v) { return String(v || "").trim(); };
   const map = {};
 
   // 直接マッピング項目
-  Object.keys(DIRECT_MAP).forEach(function(header) {
-    map[header] = clean(p[DIRECT_MAP[header]]);
+  Object.keys(WEBHOOK_FIELD_MAP).forEach(function (header) {
+    map[header] = clean(p[WEBHOOK_FIELD_MAP[header]]);
   });
 
   // 電話番号：携帯(mobile_phone)優先、無ければ固定(phone)
@@ -135,10 +129,10 @@ function buildWriteMap_(p) {
  *  - nameMatchCount: 案件名が一致した行数
  */
 function scanRows_(data, headerMap, writeMap) {
-  const propCol = headerMap[CONFIG.COL_MATCH];
-  const nameCol = headerMap[CONFIG.COL_PROJECT];
-  const inProp = writeMap[CONFIG.COL_MATCH] || "";
-  const inName = writeMap[CONFIG.COL_PROJECT] || "";
+  const propCol = headerMap[WEBHOOK_CONFIG.COL_MATCH];
+  const nameCol = headerMap[WEBHOOK_CONFIG.COL_PROJECT];
+  const inProp  = writeMap[WEBHOOK_CONFIG.COL_MATCH] || "";
+  const inName  = writeMap[WEBHOOK_CONFIG.COL_PROJECT] || "";
 
   let updateRow = null;
   let nameMatchCount = 0;
@@ -159,11 +153,11 @@ function scanRows_(data, headerMap, writeMap) {
 /** 指定列がすべて空白の最初の行(1始まり)。無ければ最終行の次 */
 function findFirstEmptyRow_(data, headerMap, checkCols) {
   const idxs = checkCols
-    .map(function(h) { return headerMap[h]; })
-    .filter(function(i) { return i != null; });
+    .map(function (h) { return headerMap[h]; })
+    .filter(function (i) { return i != null; });
 
   for (let i = 1; i < data.length; i++) {
-    const allEmpty = idxs.every(function(c) {
+    const allEmpty = idxs.every(function (c) {
       const v = data[i][c];
       return v === "" || v === null || v === undefined;
     });
@@ -174,7 +168,7 @@ function findFirstEmptyRow_(data, headerMap, checkCols) {
 
 /** writeMap の各項目を、ヘッダー名で見つけた列に書き込む（空値はスキップ＝既存値を温存） */
 function writeMappedCells_(sheet, row, headerMap, writeMap) {
-  Object.keys(writeMap).forEach(function(header) {
+  Object.keys(writeMap).forEach(function (header) {
     const col = headerMap[header];
     const val = writeMap[header];
     if (col == null) {
@@ -195,7 +189,7 @@ function parseFlexibleDate_(dateStr) {
   if (!dateStr) return { formattedDate: "", year: "" };
 
   // 全角数字 → 半角
-  let s = dateStr.replace(/[０-９]/g, function(ch) {
+  let s = dateStr.replace(/[０-９]/g, function (ch) {
     return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0);
   });
   // 区切りを「/」に統一
