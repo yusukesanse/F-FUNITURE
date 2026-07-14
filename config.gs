@@ -83,6 +83,12 @@ const CONFIG_PROJECT = {
   /** データ行の開始行（1-2行目=タイトル, 3行目=見出し, 4行目〜=データ） */
   DATA_START_ROW: 4,
 
+  /** C/D（その他商談案件合計）を書き込む際、売上予定日を必須にするか。
+   *  false（既定）: 売上予定日が空でも書き込む（年度ファイルは「今日の年度」で解決）。
+   *  true         : 従来動作。売上予定日が無ければ C/D も書き込まない。
+   *  ※ A/B（月ブロック）は月を特定できないため、この設定に関わらず常に売上予定日が必須。 */
+  REQUIRE_SALES_DATE_FOR_OTHER_DEAL: false,
+
   DATA_MAPPING: {
     storeName: "STORE", salesRep: "SALES_REP_COL", salesMonth: "SALES_MONTH_COL",
     objectNumber: "OBJECT_NO", companyName: "BTB_COMPANY", customerName: "PROJECT_NAME"

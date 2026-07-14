@@ -5,8 +5,8 @@
 // [ENTRY]    handleProjectUpdate
 // [HANDLER]  handleDateTrigger / handleStatusTrigger / handleAmountTrigger
 //            / handleTextTrigger / handleCostTrigger（原価）
-// [PATTERN]  handleSameGroupTransition / handleOtherDealSync
-//            / handleOtherDealToFinalStage / handleFinalStageToOtherDeal
+// [HELPER]   resolveOrCreateTargetRow_ / writeBaseRow_ / clearRowRange_
+//            / removeFromOtherDeal_ / removeFromMonthBlocks_
 // [TEST]     testWriteToSheet / testConfig
 // [UTILITY]  ユーティリティ関数群（createTimer 以降）
 //
@@ -19,6 +19,17 @@
 //      「全年度ファイル（DEST_SS_ID_R*）を横断」して物件Noの行を B〜L列まで消す。
 //      （売上予定日が空だと年度を特定できず、別年度ファイルのデータが消えない問題への対策）
 //   3. clearTargetRow の消去範囲を J列→L列（粗利率・粗利高を含む）に拡張。
+//
+// ★今回の修正点（2026/07）― C/D と一部 A/B が黙って書き込まれない不具合の対策
+//   ① handleStatusTrigger を「旧ステージ×新ステージ」の分岐から、現ステージだけで
+//      転記先を決める方式に全面書き換え（e.oldValue に依存しない）。
+//   ② どのハンドラも resolveOrCreateTargetRow_() で「該当行が無ければ作る」ようにし、
+//      「該当行なし → 黙ってスキップ」を廃止（必ず理由をログに残す）。
+//   ③ C/D は売上予定日が無くても書き込む（config.gs の
+//      REQUIRE_SALES_DATE_FOR_OTHER_DEAL=true で従来動作に戻せる）。A/B は月ブロック
+//      特定のため引き続き売上予定日が必須。
+//   ④ 旧パターン関数（handleSameGroupTransition / handleOtherDealSync /
+//      handleOtherDealToFinalStage / handleFinalStageToOtherDeal）を削除。
 
 // ------------------------------------------------------------------
 // [ENTRY]
@@ -158,7 +169,8 @@ function handleProjectUpdate(e) {
 // ------------------------------------------------------------------
 
 function handleDateTrigger(context) {
-  const { C, destSs, sourceData, range, timer, triggerConfig } = context;
+  const { C, destSs, sourceData, timer } = context;
+  const cols = C.DESTINATION_COLUMNS;
 
   // ※ 売上予定日のクリア（削除）は handleProjectUpdate 側で全年度横断削除を実行済み。
   //    ここに到達するのは「有効な日付が入力された」ケースのみ。
@@ -173,6 +185,11 @@ function handleDateTrigger(context) {
   Logger.log(`📅 売上予定日: ${targetDate}, 月度: ${searchMonthString}`);
   Logger.log(`📊 ステージ判定: isFinalStage(A/B)=${stageInfo.isFinalStage}, isOtherDeal(C/D)=${stageInfo.isOtherDeal}`);
 
+  if (!stageInfo.isFinalStage && !stageInfo.isOtherDeal) {
+    Logger.log(`⏭️ 転記対象外ステージ（${sourceData.currentStatus}）→ 書き込みなし`);
+    return;
+  }
+
   const destSheet = destSs.getSheetByName(C.DEST_SHEET_SALES);
   if (!destSheet) {
     Logger.log(`❌ シート「${C.DEST_SHEET_SALES}」が見つかりません。`);
@@ -186,45 +203,18 @@ function handleDateTrigger(context) {
   clearTargetRowAllYears(sourceData.objectNumber);
   timer.lap("既存データクリア");
 
-  const destData = destSheet.getDataRange().getValues();
-  const cols = C.DESTINATION_COLUMNS;
-  timer.lap("転記先データ読み込み");
-
-  let targetRowNumber;
-
-  if (stageInfo.isOtherDeal) {
-    Logger.log("🔍 行決定: C/Dランク → その他商談案件合計ブロック");
-    targetRowNumber = findExistingRowByObjectNo(destData, sourceData.objectNumber, cols);
-    if (!targetRowNumber) {
-      targetRowNumber = findOtherDealWriteRow(destData, cols);
-    }
-  } else if (stageInfo.isFinalStage) {
-    Logger.log("🔍 行決定: A/Bランク → 月ブロック");
-    const monthBlock = findMonthBlock(destData, searchMonthString, cols);
-    if (!monthBlock) {
-      Logger.log(`❌ 処理中断: 「${searchMonthString}」のブロックが見つかりません。`);
-      return;
-    }
-    Logger.log(`📍 月ブロック範囲: ${monthBlock.start} - ${monthBlock.end}`);
-    targetRowNumber = findExistingRowByObjectNo(destData, sourceData.objectNumber, cols);
-    if (!targetRowNumber) {
-      targetRowNumber = findOrCreateTargetRow(destSheet, destData, monthBlock, cols);
-    }
-  } else {
-    Logger.log(`⚠️ 処理中断: 未定義ステージ (${sourceData.currentStatus})`);
-    return;
-  }
-
+  // 行を決定（無ければ作成し、基本データを書き込む）
+  const targetRowNumber = resolveOrCreateTargetRow_(destSheet, sourceData, stageInfo, cols);
   if (!targetRowNumber) {
+    // 理由（A/B で売上予定日なし・月ブロックなし 等）は resolveOrCreateTargetRow_ 内でログ済み
     Logger.log(`❌ 処理中断: 追記行を決定できませんでした。`);
     return;
   }
-
   Logger.log(`📍 ターゲット行: ${targetRowNumber}`);
   timer.lap("行番号決定");
 
-  const values = buildWriteData(sourceData, { salesMonthString: searchMonthString });
-  writeToRow(destSheet, targetRowNumber, values);
+  // 金額・売上年月・物件No 等を最新化（新規作成／既存行のどちらでも整合させる）
+  updateExistingRowAmount(destSheet, targetRowNumber, sourceData);
   timer.lap("データ書き込み");
 
   // ★行作成時にも予定粗利率・粗利高を書き込む（入力順に依存しないようにするため）
@@ -235,6 +225,20 @@ function handleDateTrigger(context) {
   timer.lap("flush完了");
 }
 
+/**
+ * ステージ変更時の処理（全面書き換え）。
+ *
+ * 旧実装は「旧ステージ×新ステージ」の4パターンで分岐し、どこにも当てはまらない
+ * 変更（例: E 追客 / 問い合わせ / 失注 / 空欄 → A・B）を黙って捨てていた。さらに
+ * 複数セルの貼り付け・一括変更では e.oldValue が取れず oldStatus が空になり、A/B が
+ * 全滅していた。
+ *
+ * 新実装は「旧ステージに依存せず、現ステージだけで転記先を決める」方式:
+ *   ・現ステージが A/B → 月ブロックへ。以前 C/D として「その他商談」に居た残骸を掃除。
+ *   ・現ステージが C/D → その他商談ブロックへ。以前 A/B として月ブロックに居た残骸を掃除。
+ *   ・該当行が無ければ resolveOrCreateTargetRow_() が作る（黙ってスキップしない）。
+ *   ・A/B/C/D 以外（削除対象を除く）は転記対象外である旨を必ずログに残す。
+ */
 function handleStatusTrigger(context) {
   const { C, destSs, sourceData, timer } = context;
   const cols = C.DESTINATION_COLUMNS;
@@ -243,10 +247,9 @@ function handleStatusTrigger(context) {
   const oldStatus = sourceData.oldStatus;
   const objectNumber = sourceData.objectNumber;
 
-  Logger.log(`🔄 ステージ変更処理: ${oldStatus} → ${currentStatus}`);
+  Logger.log(`🔄 ステージ変更処理: ${oldStatus || "(旧ステージ不明)"} → ${currentStatus}`);
 
   const currentStage = analyzeStage(currentStatus);
-  const oldStage = analyzeStage(oldStatus);
 
   // 念のための保険（通常は handleProjectUpdate 側で処理済み）
   if (currentStage.isClearTarget) {
@@ -258,38 +261,52 @@ function handleStatusTrigger(context) {
 
   const destSheet = destSs.getSheetByName(C.DEST_SHEET_SALES);
   if (!destSheet) {
-    Logger.log(`❌ シートが見つかりません`);
+    Logger.log(`❌ シート「${C.DEST_SHEET_SALES}」が見つかりません`);
     return;
   }
 
-  // パターン0: A ↔ B
-  if (currentStage.isFinalStage && oldStage.isFinalStage &&
-      (oldStage.isStageA !== currentStage.isStageA)) {
-    Logger.log(`📝 パターン0: A↔B同期 (${oldStatus} → ${currentStatus})`);
-    handleSameGroupTransition(destSheet, sourceData, cols, timer);
+  // --- 現ステージ A/B: 月ブロックへ転記 ---
+  if (currentStage.isFinalStage) {
+    Logger.log(`📝 現ステージ A/B → 月ブロックへ転記（旧ステージは不問）`);
+    // 以前 C/D として「その他商談ブロック」に居た可能性があるので先に掃除
+    removeFromOtherDeal_(destSheet, objectNumber, cols);
+
+    const row = resolveOrCreateTargetRow_(destSheet, sourceData, currentStage, cols);
+    if (!row) {
+      // A/B は売上予定日が必須。理由は resolveOrCreateTargetRow_ 内でログ済み
+      SpreadsheetApp.flush();
+      return;
+    }
+    updateExistingRowAmount(destSheet, row, sourceData);
+    applyGrossMargin_(destSheet, row, sourceData, cols);
+    SpreadsheetApp.flush();
+    timer.lap("A/B転記完了");
+    Logger.log(`✅ A/B転記完了: ${row}行目`);
     return;
   }
 
-  // パターン1: C ↔ D
-  if (currentStage.isOtherDeal && oldStage.isOtherDeal) {
-    Logger.log(`📝 パターン1: C↔D同期`);
-    handleOtherDealSync(destSs, destSheet, sourceData, cols, timer);
+  // --- 現ステージ C/D: その他商談ブロックへ転記 ---
+  if (currentStage.isOtherDeal) {
+    Logger.log(`📝 現ステージ C/D → その他商談ブロックへ転記（旧ステージは不問）`);
+    // 以前 A/B として「月ブロック」に居た可能性があるので先に掃除
+    removeFromMonthBlocks_(destSheet, objectNumber, cols);
+
+    const row = resolveOrCreateTargetRow_(destSheet, sourceData, currentStage, cols);
+    if (!row) {
+      // REQUIRE_SALES_DATE_FOR_OTHER_DEAL=true で売上予定日なしの場合など。理由はログ済み
+      SpreadsheetApp.flush();
+      return;
+    }
+    updateExistingRowAmount(destSheet, row, sourceData);
+    applyGrossMargin_(destSheet, row, sourceData, cols);
+    SpreadsheetApp.flush();
+    timer.lap("C/D転記完了");
+    Logger.log(`✅ C/D転記完了: ${row}行目`);
     return;
   }
 
-  // パターン2: C/D → A/B
-  if (currentStage.isFinalStage && oldStage.isOtherDeal) {
-    Logger.log(`📝 パターン2: C/D→A/B移動`);
-    handleOtherDealToFinalStage(destSs, destSheet, sourceData, cols, timer);
-    return;
-  }
-
-  // パターン3: A/B → C/D
-  if (currentStage.isOtherDeal && !oldStage.isOtherDeal) {
-    Logger.log(`📝 パターン3: A/B→C/D移動`);
-    handleFinalStageToOtherDeal(destSs, destSheet, sourceData, cols, oldStage, timer);
-    return;
-  }
+  // --- それ以外（E 追客 など）: 転記対象外。黙って return せず理由を残す ---
+  Logger.log(`⏭️ 転記対象外ステージ「${currentStatus}」→ 書き込みなし（A/B/C/D と削除対象「${C.STATUS_CLEAR_TARGET.join("・")}」以外は転記しません）`);
 }
 
 function handleAmountTrigger(context) {
@@ -307,33 +324,21 @@ function handleAmountTrigger(context) {
     return;
   }
 
-  if (!isDate(sourceData.salesDate)) {
-    Logger.log(`⏭️ 売上予定日がないためスキップ`);
-    return;
-  }
-
   const destSheet = destSs.getSheetByName(C.DEST_SHEET_SALES);
   if (!destSheet) {
     Logger.log(`❌ シートが見つかりません`);
     return;
   }
+  timer.lap("転記先シート取得");
 
-  const destData = destSheet.getDataRange().getValues();
-  timer.lap("転記先データ読み込み");
-
-  let targetRowNumber;
-  if (stageInfo.isOtherDeal) {
-    targetRowNumber = findExistingRowInOtherDeal(destData, objectNumber, cols);
-  } else {
-    targetRowNumber = findExistingRowByObjectNo(destData, objectNumber, cols);
-  }
-
+  // 該当行が無ければ作る（C/D は売上予定日なしでも作成、A/B は売上予定日必須）
+  const targetRowNumber = resolveOrCreateTargetRow_(destSheet, sourceData, stageInfo, cols);
   if (!targetRowNumber) {
-    Logger.log(`ℹ️ 転記先に該当行なし（物件No: ${objectNumber}）→ 処理スキップ`);
+    // 理由は resolveOrCreateTargetRow_ 内でログ済み
     return;
   }
 
-  Logger.log(`📍 既存行発見: ${targetRowNumber}`);
+  Logger.log(`📍 対象行: ${targetRowNumber}`);
   updateExistingRowAmount(destSheet, targetRowNumber, sourceData);
 
   // 見積金額が変わると粗利額（自動計算）も変わるため、再計算を待って粗利率・粗利高も更新
@@ -370,58 +375,20 @@ function handleTextTrigger(context) {
     return;
   }
 
-  if (!isDate(sourceData.salesDate)) {
-    Logger.log(`⏭️ 売上予定日がないためスキップ`);
-    return;
-  }
-
   const destSheet = destSs.getSheetByName(C.DEST_SHEET_SALES);
   if (!destSheet) {
     Logger.log(`❌ シートが見つかりません`);
     return;
   }
+  timer.lap("転記先シート取得");
 
-  const destData = destSheet.getDataRange().getValues();
-  timer.lap("転記先データ読み込み");
-
-  let targetRowNumber;
-  if (stageInfo.isOtherDeal) {
-    targetRowNumber = findExistingRowInOtherDeal(destData, objectNumber, cols);
-  } else {
-    targetRowNumber = findExistingRowByObjectNo(destData, objectNumber, cols);
-  }
-
+  // 該当行が無ければ作る（C/D は売上予定日なしでも作成、A/B は売上予定日必須）
+  const targetRowNumber = resolveOrCreateTargetRow_(destSheet, sourceData, stageInfo, cols);
   if (!targetRowNumber) {
-    Logger.log(`ℹ️ 転記先に該当行なし → 新規作成`);
-    const destData2 = destSheet.getDataRange().getValues();
-
-    if (stageInfo.isOtherDeal) {
-      // C/D: その他商談ブロックに新規追記
-      targetRowNumber = findOtherDealWriteRow(destData2, cols);
-    } else if (stageInfo.isFinalStage) {
-      // A/B: 月ブロックに新規追記
-      const searchMonthString = formatMonthString(sourceData.salesDate);
-      const monthBlock = findMonthBlock(destData2, searchMonthString, cols);
-      if (!monthBlock) {
-        Logger.log(`❌ 月ブロック「${searchMonthString}」が見つかりません → スキップ`);
-        return;
-      }
-      targetRowNumber = findOrCreateTargetRow(destSheet, destData2, monthBlock, cols);
-    }
-
-    if (!targetRowNumber) {
-      Logger.log(`❌ 追記行を決定できません → スキップ`);
-      return;
-    }
-
-    // 基本データを新規書き込み
-    const salesMonthString = formatMonthString(sourceData.salesDate);
-    const values = buildWriteData(sourceData, { salesMonthString: salesMonthString });
-    writeToRow(destSheet, targetRowNumber, values);
-    Logger.log(`📍 新規行作成: ${targetRowNumber}`);
+    // 理由は resolveOrCreateTargetRow_ 内でログ済み
+    return;
   }
-
-  Logger.log(`📍 既存行発見: ${targetRowNumber}`);
+  Logger.log(`📍 対象行: ${targetRowNumber}`);
 
   const triggerKey = triggerConfig.key;
   const mapping = C.TEXT_TRIGGER_MAPPING[triggerKey];
@@ -493,29 +460,21 @@ function handleCostTrigger(context) {
     Logger.log(`⏭️ 転記対象外のステージ (${sourceData.currentStatus}) のためスキップ`);
     return;
   }
-  if (!isDate(sourceData.salesDate)) {
-    Logger.log(`⏭️ 売上予定日がないためスキップ（年度ファイルを特定できません）`);
-    return;
-  }
 
   const destSheet = destSs.getSheetByName(C.DEST_SHEET_SALES);
   if (!destSheet) {
     Logger.log(`❌ シートが見つかりません`);
     return;
   }
+  timer.lap("転記先シート取得");
 
-  const destData = destSheet.getDataRange().getValues();
-  timer.lap("転記先データ読み込み");
-
-  const targetRowNumber = stageInfo.isOtherDeal
-    ? findExistingRowInOtherDeal(destData, objectNumber, cols)
-    : findExistingRowByObjectNo(destData, objectNumber, cols);
-
+  // 該当行が無ければ作る（C/D は売上予定日なしでも作成、A/B は売上予定日必須）
+  const targetRowNumber = resolveOrCreateTargetRow_(destSheet, sourceData, stageInfo, cols);
   if (!targetRowNumber) {
-    Logger.log(`ℹ️ 売上進捗表に該当行なし（物件No: ${objectNumber}）→ スキップ`);
+    // 理由は resolveOrCreateTargetRow_ 内でログ済み
     return;
   }
-  Logger.log(`📍 既存行発見: ${targetRowNumber}`);
+  Logger.log(`📍 対象行: ${targetRowNumber}`);
 
   // ★ 原価が空（削除）または見積0 → 粗利率・粗利高を予定値に戻す
   if (cost <= 0 || amount <= 0) {
@@ -553,123 +512,133 @@ function handleCostTrigger(context) {
 }
 
 // ------------------------------------------------------------------
-// [PATTERN] ステージ変更パターン別
+// [HELPER] 行の解決・作成／掃除（ステージ変更・各トリガーで共通利用）
 // ------------------------------------------------------------------
 
-function handleSameGroupTransition(destSheet, sourceData, cols, timer) {
-  const destData = destSheet.getDataRange().getValues();
-  timer.lap("転記先データ読み込み");
-  const targetRowNumber = findExistingRowByObjectNo(destData, sourceData.objectNumber, cols);
-  if (targetRowNumber) {
-    Logger.log(`📍 既存行発見: ${targetRowNumber}`);
-    updateExistingRowAmount(destSheet, targetRowNumber, sourceData);
-    applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
-    SpreadsheetApp.flush();
-    timer.lap("A↔B同期書き込み完了");
-    Logger.log(`✅ A↔B同期完了`);
-  } else {
-    Logger.log(`ℹ️ 既存行なし → 売上予定日入力時に新規作成されます`);
-  }
-}
-
-function handleOtherDealSync(destSs, destSheet, sourceData, cols, timer) {
+/**
+ * 転記先の行を解決する。既存行があればその行番号を返す。無ければ:
+ *   ・C/D → findOtherDealWriteRow() で「その他商談ブロック」に追記行を確保
+ *   ・A/B → findMonthBlock() + findOrCreateTargetRow() で「月ブロック」に追記行を確保
+ * を行い、writeBaseRow_() で基本データを書き込んでから行番号を返す。
+ *
+ * A/B は売上予定日が無いと月ブロックを特定できないため、無ければ null を返し理由をログする。
+ * C/D は既定（REQUIRE_SALES_DATE_FOR_OTHER_DEAL=false）では売上予定日が空でも書き込む
+ * （年度ファイルは呼び出し元で「今日の年度」に解決済み＝警告をログする）。true にすると従来動作。
+ *
+ * @return {number|null} 行番号（1始まり）。決定できなければ null（理由はログ済み）。
+ */
+function resolveOrCreateTargetRow_(destSheet, sourceData, stageInfo, cols) {
   const C = CONFIG_PROJECT;
-  Logger.log(`💰 使用金額（ソースシート）: ${sourceData.estimatedAmount}`);
+  const objectNumber = sourceData.objectNumber;
+  const destData = destSheet.getDataRange().getValues();
 
-  if (!isDate(sourceData.salesDate)) {
-    Logger.log(`⚠️ 売上予定日がないためスキップ`);
-    return;
+  // 既存行があればそれを使う（物件Noはユニーク）
+  const existing = findExistingRowByObjectNo(destData, objectNumber, cols);
+  if (existing) {
+    Logger.log(`📍 既存行発見: ${existing}行目 (物件No: ${objectNumber})`);
+    return existing;
   }
 
-  const destData = destSheet.getDataRange().getValues();
-  timer.lap("転記先データ読み込み");
-
-  let targetRowNumber = findExistingRowInOtherDeal(destData, sourceData.objectNumber, cols);
-
-  if (targetRowNumber) {
-    Logger.log(`📍 既存行更新: ${targetRowNumber}`);
-    updateExistingRowAmount(destSheet, targetRowNumber, sourceData);
-  } else {
-    targetRowNumber = findOtherDealWriteRow(destData, cols);
-    if (!targetRowNumber) {
-      Logger.log(`❌ 追記行を決定できません`);
-      return;
+  // --- 新規作成 ---
+  if (stageInfo.isOtherDeal) {
+    // C/D: その他商談ブロック
+    if (C.REQUIRE_SALES_DATE_FOR_OTHER_DEAL && !isDate(sourceData.salesDate)) {
+      Logger.log(`❌ C/D 売上予定日が必須設定（REQUIRE_SALES_DATE_FOR_OTHER_DEAL=true）で空 → 書き込みスキップ`);
+      return null;
     }
-    Logger.log(`📍 新規追記: ${targetRowNumber}`);
+    if (!isDate(sourceData.salesDate)) {
+      Logger.log(`⚠️ C/D 売上予定日が空 → 年度ファイルは「今日の年度」で解決されています（売上年月は空欄で登録）`);
+    }
+    const row = findOtherDealWriteRow(destData, cols);
+    if (!row) {
+      Logger.log(`❌ その他商談ブロックの追記行を決定できません → 書き込みスキップ`);
+      return null;
+    }
+    writeBaseRow_(destSheet, row, sourceData);
+    Logger.log(`📍 その他商談ブロックに新規行作成: ${row}行目`);
+    return row;
+  }
+
+  if (stageInfo.isFinalStage) {
+    // A/B: 月ブロック（売上予定日が必須）
+    if (!isDate(sourceData.salesDate)) {
+      Logger.log(`❌ A/B は売上予定日が無いと月ブロックを特定できません → 書き込みスキップ（売上予定日を入力してください）`);
+      return null;
+    }
     const searchMonthString = formatMonthString(sourceData.salesDate);
-    const values = buildWriteData(sourceData, { salesMonthString: searchMonthString });
-    writeToRow(destSheet, targetRowNumber, values);
+    const monthBlock = findMonthBlock(destData, searchMonthString, cols);
+    if (!monthBlock) {
+      Logger.log(`❌ 月ブロック「${searchMonthString}」が見つかりません → 書き込みスキップ`);
+      return null;
+    }
+    const row = findOrCreateTargetRow(destSheet, destData, monthBlock, cols);
+    if (!row) {
+      Logger.log(`❌ 月ブロックの追記行を決定できません → 書き込みスキップ`);
+      return null;
+    }
+    writeBaseRow_(destSheet, row, sourceData);
+    Logger.log(`📍 月ブロックに新規行作成: ${row}行目`);
+    return row;
   }
 
-  // 金額だけでなく粗利率・粗利高も書き込む（C/Dで空になる問題の対策）
-  applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
-
-  SpreadsheetApp.flush();
-  timer.lap("書き込み完了");
+  Logger.log(`⚠️ 転記対象外ステージ（${sourceData.currentStatus}）→ 行を作成しません`);
+  return null;
 }
 
-function handleOtherDealToFinalStage(destSs, destSheet, sourceData, cols, timer) {
-  const C = CONFIG_PROJECT;
-  const START_COL = cols.STORE;
-  const END_COL = cols.GROSS_MARGIN_AMOUNT;  // ★ L列まで（粗利率・粗利高も消す）
-  const numCols = END_COL - START_COL + 1;
-
-  Logger.log(`💰 使用金額（ソースシート）: ${sourceData.estimatedAmount}`);
-
-  const destData = destSheet.getDataRange().getValues();
-  const existingRowOtherDeal = findExistingRowInOtherDeal(destData, sourceData.objectNumber, cols);
-
-  if (existingRowOtherDeal) {
-    Logger.log(`🗑️ 合計ブロックの行 ${existingRowOtherDeal} をクリア`);
-    destSheet.getRange(existingRowOtherDeal, START_COL, 1, numCols).clearContent();
-  }
-
-  if (isDate(sourceData.salesDate)) {
-    Logger.log(`📝 月ブロックへ再追記`);
-    clearTargetRow(sourceData.objectNumber, destSs, C.DEST_SHEET_SALES);
-    writeToMonthBlock(destSs, C.DEST_SHEET_SALES, sourceData.salesDate, sourceData);
-  }
-
-  SpreadsheetApp.flush();
-  timer.lap("書き込み完了");
+/**
+ * 基本データ（店舗・担当・売上年月・物件No・工務店名・案件名・見積金額）を1行に書き込む。
+ * buildWriteData + writeToRow のラッパー。売上予定日が無ければ売上年月は空欄。
+ */
+function writeBaseRow_(destSheet, row, sourceData) {
+  const salesMonthString = isDate(sourceData.salesDate) ? formatMonthString(sourceData.salesDate) : "";
+  const values = buildWriteData(sourceData, { salesMonthString: salesMonthString });
+  writeToRow(destSheet, row, values);
 }
 
-function handleFinalStageToOtherDeal(destSs, destSheet, sourceData, cols, oldStage, timer) {
-  const C = CONFIG_PROJECT;
-  const START_COL = cols.STORE;
-  const END_COL = cols.GROSS_MARGIN_AMOUNT;  // ★ L列まで
-  const numCols = END_COL - START_COL + 1;
+/** 指定行の B〜L 列（STORE 〜 GROSS_MARGIN_AMOUNT）をクリアする。 */
+function clearRowRange_(sheet, row, cols) {
+  const START_COL = cols.STORE;                // B
+  const END_COL = cols.GROSS_MARGIN_AMOUNT;    // L
+  sheet.getRange(row, START_COL, 1, END_COL - START_COL + 1).clearContent();
+}
 
-  Logger.log(`💰 使用金額（ソースシート）: ${sourceData.estimatedAmount}`);
-
-  if (oldStage.isFinalStage) {
-    Logger.log(`🗑️ 月ブロックをクリア`);
-    clearTargetRow(sourceData.objectNumber, destSs, C.DEST_SHEET_SALES);
+/**
+ * 「その他商談案件合計」ブロックにある物件Noの行を消す（C/D→A/B などで残骸を掃除）。
+ * @return {boolean} 消したら true
+ */
+function removeFromOtherDeal_(destSheet, objectNumber, cols) {
+  const data = destSheet.getDataRange().getValues();
+  const row = findExistingRowInOtherDeal(data, objectNumber, cols);
+  if (row) {
+    clearRowRange_(destSheet, row, cols);
+    Logger.log(`🗑️ その他商談ブロックから削除: ${row}行目 (物件No: ${objectNumber})`);
+    return true;
   }
+  Logger.log(`ℹ️ その他商談ブロックに物件No ${objectNumber} なし（掃除不要）`);
+  return false;
+}
 
-  if (!isDate(sourceData.salesDate)) {
-    Logger.log(`⚠️ 売上予定日がないためスキップ`);
-    return;
+/**
+ * 月ブロックにある物件Noの行を消す（A/B→C/D などで残骸を掃除）。
+ * findExistingRowByObjectNo（シート全体）の結果が findExistingRowInOtherDeal（その他商談
+ * ブロック）の結果と同じ場合は「その他商談ブロックの行」を拾っているだけなので消さない。
+ * @return {boolean} 消したら true
+ */
+function removeFromMonthBlocks_(destSheet, objectNumber, cols) {
+  const data = destSheet.getDataRange().getValues();
+  const anyRow = findExistingRowByObjectNo(data, objectNumber, cols);
+  if (!anyRow) {
+    Logger.log(`ℹ️ 月ブロックに物件No ${objectNumber} なし（掃除不要）`);
+    return false;
   }
-
-  const destData = destSheet.getDataRange().getValues();
-  let targetRowNumber = findExistingRowInOtherDeal(destData, sourceData.objectNumber, cols);
-  if (!targetRowNumber) {
-    targetRowNumber = findOtherDealWriteRow(destData, cols);
+  const otherDealRow = findExistingRowInOtherDeal(data, objectNumber, cols);
+  if (otherDealRow && anyRow === otherDealRow) {
+    Logger.log(`ℹ️ 物件No ${objectNumber} はその他商談ブロックのみ → 月ブロック掃除不要`);
+    return false;
   }
-  if (!targetRowNumber) {
-    Logger.log(`❌ 追記行を決定できません`);
-    return;
-  }
-
-  Logger.log(`📍 追記先: ${targetRowNumber}`);
-  const searchMonthString = formatMonthString(sourceData.salesDate);
-  const values = buildWriteData(sourceData, { salesMonthString: searchMonthString });
-  writeToRow(destSheet, targetRowNumber, values);
-  applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
-
-  SpreadsheetApp.flush();
-  timer.lap("書き込み完了");
+  clearRowRange_(destSheet, anyRow, cols);
+  Logger.log(`🗑️ 月ブロックから削除: ${anyRow}行目 (物件No: ${objectNumber})`);
+  return true;
 }
 
 // ------------------------------------------------------------------
@@ -1330,6 +1299,14 @@ function updateExistingRowAmount(destSheet, rowNumber, sourceData) {
   values[cols.STORE - START_COL] = getStoreName(sourceData.channel);
   values[cols.SALES_REP_COL - START_COL] = sourceData.salesRep || "";
   values[cols.PROJECT_NAME - START_COL] = sourceData.customerName || "";
+
+  // ★ 物件No と 売上年月 も更新する。
+  //   ステージ変更だけで（売上予定日入力より前に）行を作った場合に、これらが空のまま
+  //   残るのを防ぐ。売上予定日が無いとき（C/D等）は売上年月を上書きしない。
+  values[cols.OBJECT_NO - START_COL] = sourceData.objectNumber || "";
+  if (isDate(sourceData.salesDate)) {
+    values[cols.SALES_MONTH_COL - START_COL] = formatMonthString(sourceData.salesDate);
+  }
 
   destSheet.getRange(rowNumber, START_COL, 1, numCols).setValues([values]);
 }
