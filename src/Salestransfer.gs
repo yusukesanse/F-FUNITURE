@@ -40,6 +40,13 @@
 //   C. DRY 化：転記先シート取得を getDestSalesSheet_() に、標準転記
 //      （行解決→金額更新→粗利適用→flush）を executeTransfer_() に共通化。
 //      クリアは clearRowRange_() 経由に統一。
+//
+// ★今回の修正点（2026/07-b）― ステージ対象外時のデータ残存／復活バグ
+//   handleProjectUpdate の削除ガードを「現ステージが A/B・C/D 以外なら常に削除して抜ける」
+//   方式に変更（トリガー種別を問わない）。従来は status トリガーの isClearTarget
+//   （失注・問い合わせ）のみ削除していたため、「ステージのセルを空にする」「E 追客にする」
+//   や、見積金額・原価・テキスト編集でステージが対象外のとき、古い行が消えず残る／
+//   一度消えても復活する不具合があった。
 
 // ------------------------------------------------------------------
 // [ENTRY]
@@ -114,10 +121,18 @@ function handleProjectUpdate(e) {
       return;
     }
   }
-  if (triggerConfig.type === "status") {
+  // ★ステージが A/B・C/D 以外（空欄・E 追客・問い合わせ・見学のみ・失注 等）に
+  //   なったら、この物件は転記対象外。書き込みは一切行わず、既に書き込まれていれば
+  //   全年度ファイルを横断して削除する（トリガーの種類を問わず適用）。
+  //   ─ 従来は type==="status" かつ isClearTarget（失注・問い合わせ）のときだけ削除して
+  //     いたため、「ステージのセルを空にする／E 追客にする」や、他トリガー（見積金額・
+  //     原価・テキスト）の編集時にステージが対象外だと、古い行が消えず残る／復活する
+  //     不具合があった。現ステージだけで判定し、対象外なら常に削除して抜ける。
+  {
     const st = analyzeStage(sourceData.currentStatus);
-    if (st.isClearTarget) {
-      Logger.log(`🗑️ ステージ「${sourceData.currentStatus}」→ 全年度ファイルを横断して削除`);
+    if (!st.isFinalStage && !st.isOtherDeal) {
+      const stageLabel = sourceData.currentStatus || "(空欄)";
+      Logger.log(`🗑️ ステージ「${stageLabel}」は転記対象外（A/B・C/D以外）→ 全年度ファイルを横断して削除`);
       clearTargetRowAllYears(sourceData.objectNumber);
       logComplete(timer);
       return;
