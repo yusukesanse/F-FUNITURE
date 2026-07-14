@@ -1,13 +1,24 @@
-
 // ==================================================================
-// ★★★ dataTransfer - メイン処理 ★★★
+// salesTransfer.gs ― 営業進捗管理 → 売上進捗表 への転記（編集トリガー本体）
 // ==================================================================
 // [INDEX]
 // [ENTRY]    handleProjectUpdate
-// [HANDLER]  handleDateTrigger / handleStatusTrigger / handleAmountTrigger / handleTextTrigger
-// [PATTERN]  handleSameGroupTransition / handleOtherDealSync / handleOtherDealToFinalStage / handleFinalStageToOtherDeal
+// [HANDLER]  handleDateTrigger / handleStatusTrigger / handleAmountTrigger
+//            / handleTextTrigger / handleCostTrigger（原価）
+// [PATTERN]  handleSameGroupTransition / handleOtherDealSync
+//            / handleOtherDealToFinalStage / handleFinalStageToOtherDeal
 // [TEST]     testWriteToSheet / testConfig
-// [UTILITY]  旧 lib.gs 統合関数群（createTimer 以降）
+// [UTILITY]  ユーティリティ関数群（createTimer 以降）
+//
+// ※ 設定は config.gs（CONFIG_PROJECT）を参照。年度別ファイルの解決は
+//   fiscalYear.gs の resolveDestSsId に委譲（年度ごとに別スプレッドシートへ書き込む）。
+//
+// ★今回の修正点（2026/06）
+//   1. 原価を削除したとき：粗利率・粗利高を「予定値」に戻す（実粗利の残骸を消す）。
+//   2. 売上予定日クリア／ステージ→問い合わせ等の削除時：年度ファイル解決の前に
+//      「全年度ファイル（DEST_SS_ID_R*）を横断」して物件Noの行を B〜L列まで消す。
+//      （売上予定日が空だと年度を特定できず、別年度ファイルのデータが消えない問題への対策）
+//   3. clearTargetRow の消去範囲を J列→L列（粗利率・粗利高を含む）に拡張。
 
 // ------------------------------------------------------------------
 // [ENTRY]
@@ -15,19 +26,19 @@
 function handleProjectUpdate(e) {
   const timer = createTimer();
   logStart("handleProjectUpdate");
-  
+
   if (!e || !e.range) {
     Logger.log("❌ エラー: イベントオブジェクトが不正です。");
     return;
   }
-  
+
   const range = e.range;
   const sheet = range.getSheet();
   const C = CONFIG_PROJECT;
   const sheetNameTrimmed = sheet.getName().trim();
-  
+
   Logger.log(`📋 編集シート: ${sheetNameTrimmed}, 行: ${range.getRow()}, 列: ${range.getColumn()}`);
-  
+
   if (!C.SOURCE_SHEET_NAMES.includes(sheetNameTrimmed) || range.getRow() <= 1) {
     Logger.log("⏭️ 対象外のシートまたはヘッダー行のため終了");
     return;
@@ -54,13 +65,13 @@ function handleProjectUpdate(e) {
   const sourceData = extractSourceData(headers, rowValues, e, editedColHeader);
   sourceData.sheetNameTrimmed = sheetNameTrimmed;
   Logger.log(`📦 取得データ: 物件No=${sourceData.objectNumber}, 案件名=${sourceData.customerName}, ステージ=${sourceData.currentStatus}`);
-  
+
   if (!sourceData.objectNumber) {
     Logger.log("⚠️ 処理中断: 物件ナンバーが空です。");
     if (triggerConfig.type === "date" && range.getValue() !== "" && range.getValue() !== null) {
       SpreadsheetApp.getUi().alert(
-        "⚠️ 物件ナンバーが入力されていません", 
-        "売上進捗表への転記には物件ナンバーが必要です。\nZohoのデータを確認してください", 
+        "⚠️ 物件ナンバーが入力されていません",
+        "売上進捗表への転記には物件ナンバーが必要です。\nZohoのデータを確認してください",
         SpreadsheetApp.getUi().ButtonSet.OK
       );
     }
@@ -68,27 +79,60 @@ function handleProjectUpdate(e) {
   }
 
   timer.lap("データ解析完了");
-  
-  Logger.log(`📂 転記先SS (${C.DESTINATION_SS_ID}) を開いています...`);
+
+  // ★★★ 削除系は「年度ファイルの解決」より前に処理する ★★★
+  //   売上予定日が空になると年度を特定できず（＝今日の年度＝誤ったファイル）を
+  //   見てしまうため、削除時は全年度ファイルを横断して物件Noの行を消す。
+  //   （年度ファイルのIDが解決できなくても確実に削除できるようにするのが目的）
+  if (triggerConfig.type === "date" && triggerConfig.clearOnEmpty) {
+    const cellVal = range.getValue();
+    if (cellVal === "" || cellVal === null) {
+      Logger.log(`🗑️ 売上予定日クリア → 全年度ファイルを横断して削除`);
+      clearTargetRowAllYears(sourceData.objectNumber);
+      logComplete(timer);
+      return;
+    }
+  }
+  if (triggerConfig.type === "status") {
+    const st = analyzeStage(sourceData.currentStatus);
+    if (st.isClearTarget) {
+      Logger.log(`🗑️ ステージ「${sourceData.currentStatus}」→ 全年度ファイルを横断して削除`);
+      clearTargetRowAllYears(sourceData.objectNumber);
+      logComplete(timer);
+      return;
+    }
+  }
+
+  // 売上予定日の年度から、書き込み先スプレッドシート（年度別ファイル）を解決
+  const destInfo = resolveDestSsId(sourceData.salesDate);
+  if (!destInfo.ssId) {
+    const msg = `令和${destInfo.reiwaYear}年度の売上進捗表スプレッドシートが未登録です。\n`
+      + `スクリプトプロパティ「DEST_SS_ID_R${destInfo.reiwaYear}」にファイルIDを設定してください。`;
+    Logger.log(`❌ ${msg}`);
+    SpreadsheetApp.getUi().alert(msg);
+    return;
+  }
+  Logger.log(`📅 書き込み先: 令和${destInfo.reiwaYear}年度ファイル / シート=${destInfo.sheetName}`);
+
   let destSs;
   try {
-    destSs = SpreadsheetApp.openById(C.DESTINATION_SS_ID);
+    destSs = SpreadsheetApp.openById(destInfo.ssId);
   } catch (err) {
     Logger.log(`❌ エラー: 転記先SSが開けません - ${err}`);
-    SpreadsheetApp.getUi().alert("転記先のスプレッドシートIDが不正またはアクセスできません。");
+    SpreadsheetApp.getUi().alert(
+      `令和${destInfo.reiwaYear}年度の転記先ファイル（ID: ${destInfo.ssId}）が開けません。IDを確認してください。`
+    );
     return;
   }
   timer.lap("転記先SS接続");
 
-  // 売上予定日から対応する年度シート名を解決(必要なら新年度シートを自動作成)
-  const resolvedSheetName = resolveSalesSheetName(sourceData.salesDate);
-  if (resolvedSheetName !== C.DEST_SHEET_SALES) {
-    Logger.log(`📅 年度切替検出: 転記先シート = ${resolvedSheetName}`);
+  // 売上予定日トリガー時は、新年度の製造間接費シートを自動作成（無ければ）
+  if (triggerConfig.type === "date") {
+    ensureMfgSheetForFiscalYear_(destInfo.reiwaYear);
   }
-  // C をシャローコピーして、このリクエスト限定で DEST_SHEET_SALES を上書き
-  const requestC = Object.assign({}, C, { DEST_SHEET_SALES: resolvedSheetName });
 
-  const context = { C: requestC, destSs, sourceData, range, timer, triggerConfig };
+  // 書き込み先シート名は全ファイル共通の固定名（C.DEST_SHEET_SALES）
+  const context = { C, destSs, sourceData, range, timer, triggerConfig };
 
   try {
     switch (triggerConfig.type) {
@@ -96,6 +140,7 @@ function handleProjectUpdate(e) {
       case "status": handleStatusTrigger(context); break;
       case "amount": handleAmountTrigger(context); break;
       case "text":   handleTextTrigger(context);   break;
+      case "cost":   handleCostTrigger(context);   break;
       default:
         Logger.log(`⚠️ 未定義のトリガータイプ: ${triggerConfig.type}`);
     }
@@ -104,7 +149,7 @@ function handleProjectUpdate(e) {
     Logger.log(`📜 スタック: ${error.stack}`);
     SpreadsheetApp.getUi().alert(`エラーが発生しました: ${error.message}`);
   }
-  
+
   logComplete(timer);
 }
 
@@ -114,15 +159,9 @@ function handleProjectUpdate(e) {
 
 function handleDateTrigger(context) {
   const { C, destSs, sourceData, range, timer, triggerConfig } = context;
-  
-  const editedCellValue = range.getValue();
-  if (triggerConfig.clearOnEmpty && (editedCellValue === "" || editedCellValue === null)) {
-    Logger.log(`🗑️ 日付列がクリアされました。転記先のデータを削除します。`);
-    clearTargetRow(sourceData.objectNumber, destSs, C.DEST_SHEET_SALES);
-    SpreadsheetApp.flush();
-    return;
-  }
-  
+
+  // ※ 売上予定日のクリア（削除）は handleProjectUpdate 側で全年度横断削除を実行済み。
+  //    ここに到達するのは「有効な日付が入力された」ケースのみ。
   const targetDate = sourceData.salesDate;
   if (!isDate(targetDate)) {
     Logger.log(`⚠️ 処理中断: 日付が無効です。`);
@@ -142,8 +181,9 @@ function handleDateTrigger(context) {
   }
   timer.lap("転記先シート取得");
 
-  Logger.log(`🗑️ 既存データをクリア中...`);
-  clearTargetRow(sourceData.objectNumber, destSs, C.DEST_SHEET_SALES);
+  // 既存データクリア → 全年度横断（年度を跨ぐ日付変更で旧年度に行が残るのを防ぐ）
+  Logger.log(`🗑️ 既存データをクリア中...（全年度横断）`);
+  clearTargetRowAllYears(sourceData.objectNumber);
   timer.lap("既存データクリア");
 
   const destData = destSheet.getDataRange().getValues();
@@ -151,7 +191,7 @@ function handleDateTrigger(context) {
   timer.lap("転記先データ読み込み");
 
   let targetRowNumber;
-  
+
   if (stageInfo.isOtherDeal) {
     Logger.log("🔍 行決定: C/Dランク → その他商談案件合計ブロック");
     targetRowNumber = findExistingRowByObjectNo(destData, sourceData.objectNumber, cols);
@@ -186,7 +226,11 @@ function handleDateTrigger(context) {
   const values = buildWriteData(sourceData, { salesMonthString: searchMonthString });
   writeToRow(destSheet, targetRowNumber, values);
   timer.lap("データ書き込み");
-  
+
+  // ★行作成時にも予定粗利率・粗利高を書き込む（入力順に依存しないようにするため）
+  applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
+  timer.lap("粗利率・粗利高 書き込み");
+
   SpreadsheetApp.flush();
   timer.lap("flush完了");
 }
@@ -194,7 +238,7 @@ function handleDateTrigger(context) {
 function handleStatusTrigger(context) {
   const { C, destSs, sourceData, timer } = context;
   const cols = C.DESTINATION_COLUMNS;
-  
+
   const currentStatus = sourceData.currentStatus;
   const oldStatus = sourceData.oldStatus;
   const objectNumber = sourceData.objectNumber;
@@ -204,9 +248,10 @@ function handleStatusTrigger(context) {
   const currentStage = analyzeStage(currentStatus);
   const oldStage = analyzeStage(oldStatus);
 
+  // 念のための保険（通常は handleProjectUpdate 側で処理済み）
   if (currentStage.isClearTarget) {
-    Logger.log(`🗑️ 「${currentStatus}」へ変更 → データクリア`);
-    clearTargetRow(objectNumber, destSs, C.DEST_SHEET_SALES);
+    Logger.log(`🗑️ 「${currentStatus}」へ変更 → 全年度ファイルから削除`);
+    clearTargetRowAllYears(objectNumber);
     SpreadsheetApp.flush();
     return;
   }
@@ -218,7 +263,7 @@ function handleStatusTrigger(context) {
   }
 
   // パターン0: A ↔ B
-  if (currentStage.isFinalStage && oldStage.isFinalStage && 
+  if (currentStage.isFinalStage && oldStage.isFinalStage &&
       (oldStage.isStageA !== currentStage.isStageA)) {
     Logger.log(`📝 パターン0: A↔B同期 (${oldStatus} → ${currentStatus})`);
     handleSameGroupTransition(destSheet, sourceData, cols, timer);
@@ -250,7 +295,7 @@ function handleStatusTrigger(context) {
 function handleAmountTrigger(context) {
   const { C, destSs, sourceData, timer } = context;
   const cols = C.DESTINATION_COLUMNS;
-  
+
   const objectNumber = sourceData.objectNumber;
   const newAmount = sourceData.estimatedAmount || 0;
   Logger.log(`💰 見積金額変更処理: 物件No=${objectNumber}, 新金額=${newAmount}`);
@@ -290,6 +335,11 @@ function handleAmountTrigger(context) {
 
   Logger.log(`📍 既存行発見: ${targetRowNumber}`);
   updateExistingRowAmount(destSheet, targetRowNumber, sourceData);
+
+  // 見積金額が変わると粗利額（自動計算）も変わるため、再計算を待って粗利率・粗利高も更新
+  refreshGrossMarginAmount_(context, sourceData);
+  applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
+
   SpreadsheetApp.flush();
   timer.lap("見積金額更新完了");
   Logger.log(`✅ 見積金額更新完了: ${targetRowNumber}行目`);
@@ -298,7 +348,7 @@ function handleAmountTrigger(context) {
 /**
  * テキスト列編集時の処理
  * 粗利率の場合: STAGE_GROSS_MARGIN_MAPPING / STAGE_GROSS_AMOUNT_MAPPING でステージ別に列を切り替え
- *   A/B → 粗利率:J列、粗利額:L列
+ *   A/B → 粗利率:K列、粗利額:L列
  *   C   → 粗利率:J列、粗利額:L列
  *   D   → 粗利率:J列、粗利額:K列
  */
@@ -341,11 +391,10 @@ function handleTextTrigger(context) {
     targetRowNumber = findExistingRowByObjectNo(destData, objectNumber, cols);
   }
 
-  // 修正後
   if (!targetRowNumber) {
     Logger.log(`ℹ️ 転記先に該当行なし → 新規作成`);
     const destData2 = destSheet.getDataRange().getValues();
-    
+
     if (stageInfo.isOtherDeal) {
       // C/D: その他商談ブロックに新規追記
       targetRowNumber = findOtherDealWriteRow(destData2, cols);
@@ -378,13 +427,13 @@ function handleTextTrigger(context) {
   const mapping = C.TEXT_TRIGGER_MAPPING[triggerKey];
 
   if (mapping && mapping.sourceKey === "grossMarginRate") {
-    // 粗利率の書き込み
+    // 粗利率（予定）の書き込み
     const grossRateColName = C.STAGE_GROSS_MARGIN_MAPPING[sourceData.currentStatus];
     if (grossRateColName && cols[grossRateColName]) {
       const targetCol = cols[grossRateColName];
       const rateValue = sourceData.grossMarginRate || "";
       destSheet.getRange(targetRowNumber, targetCol).setValue(rateValue);
-      Logger.log(`📝 粗利率 → ${grossRateColName}(${targetCol}列): ${rateValue}`);
+      Logger.log(`📝 予定粗利率 → ${grossRateColName}(${targetCol}列): ${rateValue}`);
     } else {
       Logger.log(`⚠️ ステージ「${sourceData.currentStatus}」の粗利率列が未定義`);
     }
@@ -421,6 +470,88 @@ function handleTextTrigger(context) {
   Logger.log(`✅ 更新完了: ${targetRowNumber}行目`);
 }
 
+/**
+ * 原価入力／削除時の処理。
+ * ・原価あり → 実粗利率＝（見積−原価）/見積、実粗利額＝見積×実粗利率 を算出し、
+ *   売上進捗表の粗利率列を実粗利率に、粗利額列を実粗利額に上書き（予定→実）。
+ * ・原価が空（削除）→ 粗利率・粗利高を「予定値」に戻す（実粗利の残骸を消す）。★今回追加
+ *
+ * ※ Q列（実粗利率（自動計算）＝数式）の値を読まず、同じ式をコードで再現する。
+ *   これにより数式再計算待ち（flush+sleep）が不要で、確実かつ高速に処理できる。
+ */
+function handleCostTrigger(context) {
+  const { C, destSs, sourceData, timer } = context;
+  const cols = C.DESTINATION_COLUMNS;
+  const objectNumber = sourceData.objectNumber;
+
+  const amount = coerceToNumber(sourceData.estimatedAmount);  // 見積金額
+  const cost   = coerceToNumber(sourceData.cost);             // 原価
+  Logger.log(`🧮 原価変更処理: 物件No=${objectNumber}, 見積=${amount}, 原価=${cost}`);
+
+  const stageInfo = analyzeStage(sourceData.currentStatus);
+  if (!stageInfo.isFinalStage && !stageInfo.isOtherDeal) {
+    Logger.log(`⏭️ 転記対象外のステージ (${sourceData.currentStatus}) のためスキップ`);
+    return;
+  }
+  if (!isDate(sourceData.salesDate)) {
+    Logger.log(`⏭️ 売上予定日がないためスキップ（年度ファイルを特定できません）`);
+    return;
+  }
+
+  const destSheet = destSs.getSheetByName(C.DEST_SHEET_SALES);
+  if (!destSheet) {
+    Logger.log(`❌ シートが見つかりません`);
+    return;
+  }
+
+  const destData = destSheet.getDataRange().getValues();
+  timer.lap("転記先データ読み込み");
+
+  const targetRowNumber = stageInfo.isOtherDeal
+    ? findExistingRowInOtherDeal(destData, objectNumber, cols)
+    : findExistingRowByObjectNo(destData, objectNumber, cols);
+
+  if (!targetRowNumber) {
+    Logger.log(`ℹ️ 売上進捗表に該当行なし（物件No: ${objectNumber}）→ スキップ`);
+    return;
+  }
+  Logger.log(`📍 既存行発見: ${targetRowNumber}`);
+
+  // ★ 原価が空（削除）または見積0 → 粗利率・粗利高を予定値に戻す
+  if (cost <= 0 || amount <= 0) {
+    Logger.log(`↩️ 原価が空 → 粗利率・粗利高を予定値に戻します`);
+    revertGrossMarginToPlanned_(destSheet, targetRowNumber, sourceData, cols);
+    SpreadsheetApp.flush();
+    timer.lap("原価クリア→予定値復帰");
+    return;
+  }
+
+  // 原価あり → 実粗利率・実粗利額に上書き（予定→実）
+  const actualRate = roundTo_((amount - cost) / amount, 8);
+  const actualGrossAmount = Math.round(amount * actualRate);
+  Logger.log(`📊 実粗利率=${actualRate}, 実粗利額=${actualGrossAmount}`);
+
+  const rateColName = C.STAGE_GROSS_MARGIN_MAPPING[sourceData.currentStatus];
+  if (rateColName && cols[rateColName]) {
+    destSheet.getRange(targetRowNumber, cols[rateColName]).setValue(actualRate);
+    Logger.log(`📝 実粗利率 → ${rateColName}(${cols[rateColName]}列): ${actualRate}`);
+  } else {
+    Logger.log(`⚠️ ステージ「${sourceData.currentStatus}」の粗利率列が未定義`);
+  }
+
+  const amtColName = C.STAGE_GROSS_AMOUNT_MAPPING[sourceData.currentStatus];
+  if (amtColName && cols[amtColName]) {
+    destSheet.getRange(targetRowNumber, cols[amtColName]).setValue(actualGrossAmount);
+    Logger.log(`📝 実粗利額 → ${amtColName}(${cols[amtColName]}列): ${actualGrossAmount}`);
+  } else {
+    Logger.log(`⚠️ ステージ「${sourceData.currentStatus}」の粗利額列が未定義`);
+  }
+
+  SpreadsheetApp.flush();
+  timer.lap("原価転記完了");
+  Logger.log(`✅ 原価転記完了: ${targetRowNumber}行目`);
+}
+
 // ------------------------------------------------------------------
 // [PATTERN] ステージ変更パターン別
 // ------------------------------------------------------------------
@@ -432,6 +563,7 @@ function handleSameGroupTransition(destSheet, sourceData, cols, timer) {
   if (targetRowNumber) {
     Logger.log(`📍 既存行発見: ${targetRowNumber}`);
     updateExistingRowAmount(destSheet, targetRowNumber, sourceData);
+    applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
     SpreadsheetApp.flush();
     timer.lap("A↔B同期書き込み完了");
     Logger.log(`✅ A↔B同期完了`);
@@ -443,17 +575,17 @@ function handleSameGroupTransition(destSheet, sourceData, cols, timer) {
 function handleOtherDealSync(destSs, destSheet, sourceData, cols, timer) {
   const C = CONFIG_PROJECT;
   Logger.log(`💰 使用金額（ソースシート）: ${sourceData.estimatedAmount}`);
-  
+
   if (!isDate(sourceData.salesDate)) {
     Logger.log(`⚠️ 売上予定日がないためスキップ`);
     return;
   }
-  
+
   const destData = destSheet.getDataRange().getValues();
   timer.lap("転記先データ読み込み");
-  
+
   let targetRowNumber = findExistingRowInOtherDeal(destData, sourceData.objectNumber, cols);
-  
+
   if (targetRowNumber) {
     Logger.log(`📍 既存行更新: ${targetRowNumber}`);
     updateExistingRowAmount(destSheet, targetRowNumber, sourceData);
@@ -468,7 +600,10 @@ function handleOtherDealSync(destSs, destSheet, sourceData, cols, timer) {
     const values = buildWriteData(sourceData, { salesMonthString: searchMonthString });
     writeToRow(destSheet, targetRowNumber, values);
   }
-  
+
+  // 金額だけでなく粗利率・粗利高も書き込む（C/Dで空になる問題の対策）
+  applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
+
   SpreadsheetApp.flush();
   timer.lap("書き込み完了");
 }
@@ -476,14 +611,14 @@ function handleOtherDealSync(destSs, destSheet, sourceData, cols, timer) {
 function handleOtherDealToFinalStage(destSs, destSheet, sourceData, cols, timer) {
   const C = CONFIG_PROJECT;
   const START_COL = cols.STORE;
-  const END_COL = cols.SALES_COL;
+  const END_COL = cols.GROSS_MARGIN_AMOUNT;  // ★ L列まで（粗利率・粗利高も消す）
   const numCols = END_COL - START_COL + 1;
-  
+
   Logger.log(`💰 使用金額（ソースシート）: ${sourceData.estimatedAmount}`);
-  
+
   const destData = destSheet.getDataRange().getValues();
   const existingRowOtherDeal = findExistingRowInOtherDeal(destData, sourceData.objectNumber, cols);
-  
+
   if (existingRowOtherDeal) {
     Logger.log(`🗑️ 合計ブロックの行 ${existingRowOtherDeal} をクリア`);
     destSheet.getRange(existingRowOtherDeal, START_COL, 1, numCols).clearContent();
@@ -494,7 +629,7 @@ function handleOtherDealToFinalStage(destSs, destSheet, sourceData, cols, timer)
     clearTargetRow(sourceData.objectNumber, destSs, C.DEST_SHEET_SALES);
     writeToMonthBlock(destSs, C.DEST_SHEET_SALES, sourceData.salesDate, sourceData);
   }
-  
+
   SpreadsheetApp.flush();
   timer.lap("書き込み完了");
 }
@@ -502,11 +637,11 @@ function handleOtherDealToFinalStage(destSs, destSheet, sourceData, cols, timer)
 function handleFinalStageToOtherDeal(destSs, destSheet, sourceData, cols, oldStage, timer) {
   const C = CONFIG_PROJECT;
   const START_COL = cols.STORE;
-  const END_COL = cols.SALES_COL;
+  const END_COL = cols.GROSS_MARGIN_AMOUNT;  // ★ L列まで
   const numCols = END_COL - START_COL + 1;
-  
+
   Logger.log(`💰 使用金額（ソースシート）: ${sourceData.estimatedAmount}`);
-  
+
   if (oldStage.isFinalStage) {
     Logger.log(`🗑️ 月ブロックをクリア`);
     clearTargetRow(sourceData.objectNumber, destSs, C.DEST_SHEET_SALES);
@@ -516,7 +651,7 @@ function handleFinalStageToOtherDeal(destSs, destSheet, sourceData, cols, oldSta
     Logger.log(`⚠️ 売上予定日がないためスキップ`);
     return;
   }
-  
+
   const destData = destSheet.getDataRange().getValues();
   let targetRowNumber = findExistingRowInOtherDeal(destData, sourceData.objectNumber, cols);
   if (!targetRowNumber) {
@@ -531,7 +666,8 @@ function handleFinalStageToOtherDeal(destSs, destSheet, sourceData, cols, oldSta
   const searchMonthString = formatMonthString(sourceData.salesDate);
   const values = buildWriteData(sourceData, { salesMonthString: searchMonthString });
   writeToRow(destSheet, targetRowNumber, values);
-  
+  applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
+
   SpreadsheetApp.flush();
   timer.lap("書き込み完了");
 }
@@ -569,40 +705,48 @@ function testConfig() {
   Logger.log(`転記先SS ID: ${C.DESTINATION_SS_ID}`);
   Logger.log(`転記先シート: ${C.DEST_SHEET_SALES}`);
   Logger.log(`転記元シート: ${C.SOURCE_SHEET_NAMES.join(", ")}`);
-  
+
   Logger.log("\n--- トリガー列 ---");
   for (const [key, config] of Object.entries(C.TRIGGER_COLUMNS)) {
     Logger.log(`  ${key}: ${config.header} (${config.type})`);
   }
-  
-  Logger.log("\n--- テキストトリガーマッピング ---");
-  for (const [key, mapping] of Object.entries(C.TEXT_TRIGGER_MAPPING)) {
-    Logger.log(`  ${key} → destCol: ${mapping.destCol}, sourceKey: ${mapping.sourceKey}`);
-  }
-  
-  Logger.log("\n--- ステージ別見積金額列 ---");
+
+  Logger.log("\n--- ステージ別 見積金額列 ---");
   for (const [stage, col] of Object.entries(C.STAGE_AMOUNT_MAPPING)) {
     Logger.log(`  ${stage} → ${col}`);
   }
-  
-  Logger.log("\n--- ステージ別粗利率列 ---");
+
+  Logger.log("\n--- ステージ別 粗利率列 ---");
   for (const [stage, col] of Object.entries(C.STAGE_GROSS_MARGIN_MAPPING)) {
     Logger.log(`  ${stage} → ${col}`);
   }
-  
-  Logger.log("\n--- ステージ別粗利額列 ---");
+
+  Logger.log("\n--- ステージ別 粗利額列 ---");
   for (const [stage, col] of Object.entries(C.STAGE_GROSS_AMOUNT_MAPPING)) {
     Logger.log(`  ${stage} → ${col}`);
   }
-  
+
   Logger.log("\n--- 店舗マップ ---");
   for (const [channel, store] of Object.entries(C.STORE_MAP)) {
     Logger.log(`  ${channel} → ${store}`);
   }
 }
 
+/** ★追加：登録済みの年度ファイル一覧を確認する診断用関数 */
+function testRegisteredYearFiles() {
+  const list = getAllRegisteredDestSs_();
+  Logger.log("=== 登録済み年度ファイル（DEST_SS_ID_R*）===");
+  if (list.length === 0) {
+    Logger.log("  ❌ 1件も登録されていません。スクリプトプロパティを確認してください。");
+    return;
+  }
+  list.forEach(function (yf) {
+    Logger.log(`  R${yf.reiwaYear} → ${yf.ssId}`);
+  });
+}
+
 // ------------------------------------------------------------------
-// [UTILITY] 旧 lib.gs 統合
+// [UTILITY]
 // ------------------------------------------------------------------
 
 // ==================================================================
@@ -613,7 +757,7 @@ function createTimer() {
   const startTime = new Date().getTime();
   let lastLap = startTime;
   return {
-    lap: function(label) {
+    lap: function (label) {
       const now = new Date().getTime();
       const lapTime = now - lastLap;
       const totalTime = now - startTime;
@@ -621,7 +765,7 @@ function createTimer() {
       lastLap = now;
       return lapTime;
     },
-    total: function() {
+    total: function () {
       return new Date().getTime() - startTime;
     }
   };
@@ -675,6 +819,101 @@ function formatMonthString(date) {
   return Utilities.formatDate(date, CONFIG_PROJECT.TIMEZONE, CONFIG_PROJECT.MONTH_FORMAT);
 }
 
+/** 小数を指定桁で四捨五入する（実粗利率の桁合わせに使用） */
+function roundTo_(num, digits) {
+  const p = Math.pow(10, digits);
+  return Math.round(num * p) / p;
+}
+
+/**
+ * 予定粗利率・粗利高を、ステージ別の列に書き込む。
+ * 行作成時（handleDateTrigger）にも呼び、入力順に依存せず粗利率・粗利高が入るようにする。
+ * ソース側の値が空のときは上書きしない（既存の実粗利率などを消さないため）。
+ */
+function applyGrossMargin_(destSheet, targetRow, sourceData, cols) {
+  const C = CONFIG_PROJECT;
+  const status = sourceData.currentStatus;
+  const rate = sourceData.grossMarginRate;        // 予定粗利率
+  const amount = sourceData.grossMarginAmount;    // 粗利額（自動計算）
+
+  const isEmpty = function (v) { return v === "" || v === null || v === undefined; };
+
+  // 粗利率（A/B→K列、C/D→J列）
+  const rateColName = C.STAGE_GROSS_MARGIN_MAPPING[status];
+  if (rateColName && cols[rateColName] && !isEmpty(rate)) {
+    destSheet.getRange(targetRow, cols[rateColName]).setValue(rate);
+    Logger.log(`📝 予定粗利率 → ${rateColName}(${cols[rateColName]}列): ${rate}`);
+  }
+
+  // 粗利高（A/B/C→L列、D→K列）
+  const amtColName = C.STAGE_GROSS_AMOUNT_MAPPING[status];
+  if (amtColName && cols[amtColName] && !isEmpty(amount)) {
+    destSheet.getRange(targetRow, cols[amtColName]).setValue(amount);
+    Logger.log(`📝 粗利高 → ${amtColName}(${cols[amtColName]}列): ${amount}`);
+  }
+}
+
+/**
+ * ★今回追加：原価が削除されたとき、粗利率・粗利高を「予定値」に戻す。
+ *   粗利率列 ← 予定粗利率（手入力）。空ならクリア。
+ *   粗利高列 ← 予定粗利額＝見積金額×予定粗利率（コードで算出。数式の再計算待ち不要）。
+ *            予定粗利率か見積金額が空ならクリア。
+ *   ※ 数式値（粗利額（自動計算））を読まずコードで計算するのは、原価削除直後の
+ *     再計算タイミングに左右されず、確実な値を書くため。
+ */
+function revertGrossMarginToPlanned_(destSheet, targetRow, sourceData, cols) {
+  const C = CONFIG_PROJECT;
+  const status = sourceData.currentStatus;
+  const isEmpty = function (v) { return v === "" || v === null || v === undefined; };
+
+  const rate = sourceData.grossMarginRate;                  // 予定粗利率（手入力）
+  const amount = coerceToNumber(sourceData.estimatedAmount); // 見積金額
+
+  // 粗利率列：予定粗利率があればそれを、なければクリア
+  const rateColName = C.STAGE_GROSS_MARGIN_MAPPING[status];
+  if (rateColName && cols[rateColName]) {
+    const cell = destSheet.getRange(targetRow, cols[rateColName]);
+    if (isEmpty(rate)) { cell.clearContent(); } else { cell.setValue(rate); }
+    Logger.log(`↩️ 粗利率を予定値へ: ${isEmpty(rate) ? "(クリア)" : rate}`);
+  }
+
+  // 粗利高列：予定粗利額＝見積×予定粗利率。どちらか空ならクリア
+  const amtColName = C.STAGE_GROSS_AMOUNT_MAPPING[status];
+  if (amtColName && cols[amtColName]) {
+    const cell = destSheet.getRange(targetRow, cols[amtColName]);
+    if (isEmpty(rate) || amount <= 0) {
+      cell.clearContent();
+      Logger.log(`↩️ 粗利高を予定値へ: (クリア)`);
+    } else {
+      const plannedAmount = Math.round(amount * coerceToNumber(rate));
+      cell.setValue(plannedAmount);
+      Logger.log(`↩️ 粗利高を予定値へ: ${plannedAmount}`);
+    }
+  }
+}
+
+/**
+ * 見積金額の変更後、ソースの「粗利額（自動計算）」の再計算を待って読み直し、
+ * sourceData.grossMarginAmount を最新値に更新する。
+ * （予定粗利率は手入力で見積変更の影響を受けないため、粗利額のみ更新）
+ */
+function refreshGrossMarginAmount_(context, sourceData) {
+  SpreadsheetApp.flush();
+  Utilities.sleep(1000); // 数式（粗利額（自動計算））の再計算待ち
+  const sheet = context.range.getSheet();
+  const rowNum = context.range.getRow();
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const rowValues = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const amtHeader = CONFIG_PROJECT.SOURCE_COLUMNS.GROSS_MARGIN_AMOUNT.header; // "粗利額（自動計算）"
+  const idx = headers.indexOf(amtHeader);
+  if (idx !== -1) {
+    sourceData.grossMarginAmount = rowValues[idx];
+    Logger.log(`🔄 粗利額（自動計算）再読込: ${sourceData.grossMarginAmount}`);
+  }
+}
+
 // ==================================================================
 // データ取得関連
 // ==================================================================
@@ -714,8 +953,10 @@ function extractSourceData(headers, rowValues, e, editedHeader) {
   result.salesRep = result.SALES_REP;
   result.channel = result.CHANNEL;
   result.companyName = result.COMPANY_NAME;
-  result.grossMarginRate = result.GROSS_MARGIN_RATE;
+  result.grossMarginRate = result.GROSS_MARGIN_RATE;       // 予定粗利率
   result.grossMarginAmount = result.GROSS_MARGIN_AMOUNT;
+  result.cost = result.COST;                               // 原価
+  result.actualGrossMarginRate = result.ACTUAL_GROSS_MARGIN_RATE; // 実粗利率（参考）
 
   return result;
 }
@@ -783,7 +1024,6 @@ function findMonthBlock(data, searchMonthString, cols) {
 
   const blockEnd = monthHeaderRow - 1;
   // ★ 最初の月ブロック(前月ヘッダーなし)の場合は、0ではなくデータ開始行を起点にする
-  //   (1〜2行目=タイトル, 3行目=見出し を避け、4行目〜をデータ範囲とする)
   const dataStartIdx = (CONFIG_PROJECT.DATA_START_ROW || 4) - 1;  // 0始まりインデックス
   const blockStart = (prevMonthHeaderRow === -1) ? dataStartIdx : prevMonthHeaderRow + 1;
   return { start: blockStart, end: blockEnd };
@@ -917,31 +1157,96 @@ function ensureRowExists(sheet, rowNumber) {
   }
 }
 
+/**
+ * 指定した1ファイル内の固定名シートから、物件Noの行を消す（B〜L列）。
+ * ※ 売上予定日が確定していて年度ファイルが正しく解決できる場面で使う。
+ *   削除（売上予定日クリア等）では年度を取り違えるため、clearTargetRowAllYears を使う。
+ */
 function clearTargetRow(objectNumber, destSs, sheetName) {
   const C = CONFIG_PROJECT;
   const cols = C.DESTINATION_COLUMNS;
 
-  // 段階的検索: まず指定シート(最新年度)を先頭にした年度シート名リストを取得
-  const sheetNames = getFiscalSalesSheetNames_(destSs, sheetName);
+  const sheet = destSs.getSheetByName(sheetName);
+  if (!sheet) {
+    Logger.log(`ℹ️ クリア: シート「${sheetName}」が見つかりません`);
+    return;
+  }
 
-  for (let s = 0; s < sheetNames.length; s++) {
-    const name = sheetNames[s];
-    const sheet = destSs.getSheetByName(name);
+  const data = sheet.getDataRange().getValues();
+  const targetRowNumber = findExistingRowByObjectNo(data, objectNumber, cols);
+
+  if (targetRowNumber) {
+    const START_COL = cols.STORE;
+    const END_COL = cols.GROSS_MARGIN_AMOUNT;  // ★ L列まで（粗利率・粗利高も消す）
+    Logger.log(`🗑️ クリア: 「${sheetName}」${targetRowNumber}行目 (物件No: ${objectNumber})`);
+    sheet.getRange(targetRowNumber, START_COL, 1, END_COL - START_COL + 1).clearContent();
+    return;
+  }
+
+  Logger.log(`ℹ️ クリア対象なし: 物件No ${objectNumber} は「${sheetName}」に見つかりませんでした`);
+}
+
+/**
+ * ★今回追加：登録済みの全年度ファイル {reiwaYear, ssId} を年度降順で返す。
+ *   スクリプトプロパティのキー "DEST_SS_ID_R{N}"（例 DEST_SS_ID_R7, DEST_SS_ID_R8）を走査する。
+ */
+function getAllRegisteredDestSs_() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const prefix = FY_CONFIG.DEST_SS_ID_KEY_PREFIX; // "DEST_SS_ID_R"
+  const list = [];
+  Object.keys(props).forEach(function (key) {
+    if (key.indexOf(prefix) !== 0) return;
+    const reiwaYear = parseInt(key.substring(prefix.length), 10);
+    const ssId = String(props[key] || "").trim();
+    if (!isNaN(reiwaYear) && ssId) list.push({ reiwaYear: reiwaYear, ssId: ssId });
+  });
+  list.sort(function (a, b) { return b.reiwaYear - a.reiwaYear; }); // 新しい年度順
+  return list;
+}
+
+/**
+ * ★今回追加：全年度ファイルを横断して、物件Noの行を消す（B〜L列）。
+ *   売上予定日が空でも、データがどの年度ファイルにあっても確実に消すための関数。
+ *   物件Noはユニークなので、見つけた時点で打ち切る（通常は1ファイル目で完結＝高速）。
+ *   @return {boolean} 1件でも消したら true
+ */
+function clearTargetRowAllYears(objectNumber) {
+  const C = CONFIG_PROJECT;
+  const cols = C.DESTINATION_COLUMNS;
+  const sheetName = C.DEST_SHEET_SALES;
+  const yearFiles = getAllRegisteredDestSs_();
+
+  if (yearFiles.length === 0) {
+    Logger.log(`⚠️ 登録済みの年度ファイルがありません（スクリプトプロパティ DEST_SS_ID_R* 未設定）`);
+    return false;
+  }
+
+  for (let k = 0; k < yearFiles.length; k++) {
+    const yf = yearFiles[k];
+    let ss;
+    try {
+      ss = SpreadsheetApp.openById(yf.ssId);
+    } catch (err) {
+      Logger.log(`⚠️ R${yf.reiwaYear}ファイルが開けません（スキップ）: ${err}`);
+      continue;
+    }
+    const sheet = ss.getSheetByName(sheetName);
     if (!sheet) continue;
 
     const data = sheet.getDataRange().getValues();
     const targetRowNumber = findExistingRowByObjectNo(data, objectNumber, cols);
-
     if (targetRowNumber) {
       const START_COL = cols.STORE;
-      const END_COL = cols.SALES_COL;
-      Logger.log(`🗑️ クリア: 「${name}」${targetRowNumber}行目 (物件No: ${objectNumber})`);
+      const END_COL = cols.GROSS_MARGIN_AMOUNT;  // L列まで
       sheet.getRange(targetRowNumber, START_COL, 1, END_COL - START_COL + 1).clearContent();
-      return;  // 物件Noはユニークなので、見つけたら打ち切り
+      SpreadsheetApp.flush();
+      Logger.log(`🗑️ クリア: R${yf.reiwaYear}「${sheetName}」${targetRowNumber}行目 (物件No: ${objectNumber})`);
+      return true; // 物件Noはユニーク → 打ち切り
     }
   }
 
-  Logger.log(`ℹ️ クリア対象なし: 全年度シートを探しましたが物件No ${objectNumber} は見つかりませんでした`);
+  Logger.log(`ℹ️ クリア対象なし: 物件No ${objectNumber} はどの年度ファイルにも見つかりませんでした`);
+  return false;
 }
 
 // ==================================================================
@@ -1051,4 +1356,5 @@ function writeToMonthBlock(destSs, sheetName, targetDate, sourceData) {
 
   const values = buildWriteData(sourceData, { salesMonthString: searchMonthString });
   writeToRow(destSheet, targetRowNumber, values);
+  applyGrossMargin_(destSheet, targetRowNumber, sourceData, cols);
 }
